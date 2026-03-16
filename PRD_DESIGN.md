@@ -1,5 +1,5 @@
 # PRD — Design
-### Latch + 3000 Labs | Lexie (Lead) + Designer 2 (Support)
+### Latch + 3000 Labs 
 
 ---
 
@@ -31,7 +31,7 @@ Both need to feel premium, technical, and trustworthy. The target audience is de
 **Website (single page or minimal)**
 - Hero: what 3000 Labs does in one sentence
 - Products: Latch (link out) + placeholder for future products
-- Team: Frankie (founder) + Lexie (co-founder) — short bios
+- Team: Frankie (founder)
 - Contact / links (Twitter, GitHub)
 - No blog needed at this stage
 
