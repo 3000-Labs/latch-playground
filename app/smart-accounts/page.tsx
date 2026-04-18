@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useCallback } from "react";
 import { connectWallet, WalletType, WalletConnectionResult } from "@/lib/wallets";
+import { signAuthEntry } from "@stellar/freighter-api";
 import {
   Loader2, ExternalLink, Activity, CheckCircle,
   AlertTriangle, Zap, Hash, ArrowRight,
@@ -17,15 +18,14 @@ const AUTH_PREFIX     = "Stellar Smart Account Auth:\n";
 
 // ─── Wallet config ────────────────────────────────────────────────────────────
 
-const WALLETS: { type: WalletType; label: string; sub: string; accent: string }[] = [
-  { type: "phantom", label: "Phantom", sub: "Ed25519 wallet (only supported)", accent: "indigo" },
+const SOLANA_WALLETS: { type: WalletType; label: string; sub: string }[] = [
+  { type: "phantom", label: "Phantom", sub: "External Ed25519 signer" },
 ];
 
-const accentClasses: Record<string, string> = {
-  indigo: "bg-indigo-500/10 text-indigo-500",
-  yellow: "bg-yellow-500/10 text-yellow-500",
-  blue:   "bg-blue-500/10  text-blue-500",
-};
+const STELLAR_WALLETS: { type: WalletType; label: string; sub: string }[] = [
+  { type: "freighter", label: "Freighter", sub: "Delegated signer" },
+];
+
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
@@ -56,7 +56,13 @@ export default function SmartAccountsPage() {
     try {
       const info = await connectWallet(type);
       setWallet(info);
-      const res  = await fetch(`/api/smart-account/factory?pubkey=${info.publicKeyHex}`);
+
+      // Look up whether a smart account is already deployed for this key
+      const lookupUrl = type === "freighter"
+        ? `/api/smart-account/freighter?gAddress=${info.gAddress}`
+        : `/api/smart-account/factory?pubkey=${info.publicKeyHex}`;
+
+      const res  = await fetch(lookupUrl);
       const data = await res.json();
       if (data.deployed && data.smartAccountAddress) {
         setSmartAccountAddr(data.smartAccountAddress);
@@ -76,10 +82,16 @@ export default function SmartAccountsPage() {
     setSetupState("deploying");
     setSetupError(null);
     try {
-      const res  = await fetch("/api/smart-account/factory", {
+      const isFreighter = wallet.walletType === "freighter";
+      const endpoint = isFreighter ? "/api/smart-account/freighter" : "/api/smart-account/factory";
+      const body = isFreighter
+        ? { gAddress: wallet.gAddress }
+        : { publicKeyHex: wallet.publicKeyHex };
+
+      const res  = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ publicKeyHex: wallet.publicKeyHex }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Failed to deploy smart account.");
@@ -99,82 +111,92 @@ export default function SmartAccountsPage() {
     setTxHash(null);
 
     try {
-      // 3a. Build tx & get auth digest
-      const buildRes = await fetch("/api/transaction/build", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ smartAccountAddress: smartAccountAddr }),
-      });
-      const build = await buildRes.json();
-      if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
-      const { txXdr, authEntryXdr, authDigestHex } = build;
+      if (wallet.walletType === "freighter") {
+        // ── Freighter path (Delegated signer) ──────────────────────────────
+        // 1. Build — server returns both auth entries ready to sign
+        const buildRes = await fetch("/api/transaction/build-delegated", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ smartAccountAddress: smartAccountAddr, gAddress: wallet.gAddress }),
+        });
+        const build = await buildRes.json();
+        if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
+        const { txXdr, smartAccountAuthEntryXdr, gAddressAuthEntryXdr } = build;
 
-      const signPrefixedMessage = async (hashHex: string) => {
-        const normalizedHash = hashHex.toLowerCase();
-        const prefixedMessage = AUTH_PREFIX + normalizedHash;
-        const messageBytes = new TextEncoder().encode(prefixedMessage);
-        let authSignatureHex: string;
+        // 2. Have Freighter sign the G-address auth entry via signAuthEntry
+        setTxState("signing");
+        const signedGAddrEntryXdr = await signAuthEntry(gAddressAuthEntryXdr);
 
-        if (wallet.walletType !== "phantom") {
-          throw new Error("Only Phantom wallet is supported for smart account auth.");
-        }
-
-        const provider = (window as any).phantom?.solana;
-        if (!provider) throw new Error("Phantom not found.");
-        const result = await provider.signMessage(messageBytes, "utf8");
-        authSignatureHex = Buffer.from(result.signature).toString("hex");
-
-        return { prefixedMessage, authSignatureHex };
-      };
-
-      const submitOnce = async (authSignatureHex: string, prefixedMessage: string) => {
-        const submitRes = await fetch("/api/transaction/submit", {
+        // 3. Submit both entries (smart account entry already has AuthPayload set server-side)
+        setTxState("submitting");
+        const submitRes = await fetch("/api/transaction/submit-delegated", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             txXdr,
-            authEntryXdr,
-            authSignatureHex,
-            prefixedMessage,
-            publicKeyHex: wallet.publicKeyHex,
+            authEntriesXdr: [smartAccountAuthEntryXdr, signedGAddrEntryXdr],
           }),
         });
         const submitData = await submitRes.json();
-        return { submitRes, submitData };
-      };
+        if (!submitRes.ok) throw new Error(submitData.error ?? "Submit failed.");
 
-      // 3b. Sign + submit (retry once with verifier hash if provided)
-      setTxState("signing");
-      const first = await signPrefixedMessage(authDigestHex);
+        setTxHash(submitData.hash);
+        setTxState("success");
+        await fetchCounter();
+      } else {
+        // ── Phantom path (External Ed25519 signer) ─────────────────────────
+        const buildRes = await fetch("/api/transaction/build", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ smartAccountAddress: smartAccountAddr }),
+        });
+        const build = await buildRes.json();
+        if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
+        const { txXdr, authEntryXdr, authDigestHex } = build;
 
-      setTxState("submitting");
-      let { submitRes, submitData } = await submitOnce(first.authSignatureHex, first.prefixedMessage);
+        const signPrefixedMessage = async (hashHex: string) => {
+          const prefixedMessage = AUTH_PREFIX + hashHex.toLowerCase();
+          const messageBytes = new TextEncoder().encode(prefixedMessage);
+          const provider = (window as any).phantom?.solana;
+          if (!provider) throw new Error("Phantom not found.");
+          const result = await provider.signMessage(messageBytes, "utf8");
+          return {
+            prefixedMessage,
+            authSignatureHex: Buffer.from(result.signature).toString("hex"),
+          };
+        };
 
-      if (!submitRes.ok && submitData?.verifierHashHex && typeof submitData.verifierHashHex === "string") {
+        const submitOnce = async (authSignatureHex: string, prefixedMessage: string) => {
+          const submitRes = await fetch("/api/transaction/submit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              txXdr, authEntryXdr, authSignatureHex, prefixedMessage,
+              publicKeyHex: wallet.publicKeyHex,
+            }),
+          });
+          return { submitRes, submitData: await submitRes.json() };
+        };
+
         setTxState("signing");
-        const second = await signPrefixedMessage(submitData.verifierHashHex);
+        const first = await signPrefixedMessage(authDigestHex);
         setTxState("submitting");
-        ({ submitRes, submitData } = await submitOnce(second.authSignatureHex, second.prefixedMessage));
-      }
+        let { submitRes, submitData } = await submitOnce(first.authSignatureHex, first.prefixedMessage);
 
-      if (!submitRes.ok) {
-        const parts: string[] = [submitData?.error ?? "Submit failed."];
-        if (submitData?.verifierHashHex) parts.push(`verifierHashHex: ${submitData.verifierHashHex}`);
-        if (typeof submitData?.localVerifyPrefixPlusHexUtf8 === "boolean") {
-          parts.push(`localVerifyPrefixPlusHexUtf8: ${submitData.localVerifyPrefixPlusHexUtf8}`);
+        if (!submitRes.ok && submitData?.verifierHashHex) {
+          setTxState("signing");
+          const second = await signPrefixedMessage(submitData.verifierHashHex);
+          setTxState("submitting");
+          ({ submitRes, submitData } = await submitOnce(second.authSignatureHex, second.prefixedMessage));
         }
-        if (typeof submitData?.localVerifyPrefixPlusRawHash === "boolean") {
-          parts.push(`localVerifyPrefixPlusRawHash: ${submitData.localVerifyPrefixPlusRawHash}`);
-        }
-        throw new Error(parts.join("\n"));
-      }
 
-      setTxHash(submitData.hash);
-      setTxState("success");
-      await fetchCounter();
+        if (!submitRes.ok) throw new Error(submitData?.error ?? "Submit failed.");
+        setTxHash(submitData.hash);
+        setTxState("success");
+        await fetchCounter();
+      }
     } catch (err: any) {
-      const msg = err?.message ?? "Transaction failed.";
-      setTxError(msg);
+      setTxError(err?.message ?? "Transaction failed.");
       setTxState("error");
     }
   }, [wallet, smartAccountAddr]);
@@ -229,9 +251,10 @@ export default function SmartAccountsPage() {
                 <p className="text-sm text-muted-foreground">Select an Ed25519 signer to own your Smart Account.</p>
               </div>
 
-              {/* Wallet buttons */}
-              <div className="space-y-3">
-                {WALLETS.map(({ type, label, sub, accent }) => (
+              {/* Solana wallets */}
+              <div className="space-y-2">
+                <p className="text-xs font-mono text-muted-foreground uppercase tracking-wider">Solana</p>
+                {SOLANA_WALLETS.map(({ type, label, sub }) => (
                   <button
                     key={type}
                     id={`wallet-btn-${type}`}
@@ -239,7 +262,39 @@ export default function SmartAccountsPage() {
                     disabled={setupState !== "idle" && setupState !== "error"}
                     className="flex items-center gap-3 w-full p-3 sm:p-4 rounded-xl border border-border bg-background hover:bg-muted/50 hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-left"
                   >
-                    <div className={`w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 ${accentClasses[accent]}`}>
+                    <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 bg-indigo-500/10 text-indigo-500">
+                      {label[0]}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-mono text-sm font-medium truncate">{label}</div>
+                      <div className="text-xs text-muted-foreground truncate">{sub}</div>
+                    </div>
+                    {wallet?.walletType === type && (
+                      <CheckCircle className="w-4 h-4 text-primary ml-auto shrink-0" />
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              {/* Divider */}
+              <div className="flex items-center gap-3 text-muted-foreground/40">
+                <div className="flex-1 h-px bg-border" />
+                <span className="text-xs font-mono uppercase tracking-wider">or</span>
+                <div className="flex-1 h-px bg-border" />
+              </div>
+
+              {/* Stellar wallets */}
+              <div className="space-y-2">
+                <p className="text-xs font-mono text-muted-foreground uppercase tracking-wider">Stellar</p>
+                {STELLAR_WALLETS.map(({ type, label, sub }) => (
+                  <button
+                    key={type}
+                    id={`wallet-btn-${type}`}
+                    onClick={() => handleConnect(type)}
+                    disabled={setupState !== "idle" && setupState !== "error"}
+                    className="flex items-center gap-3 w-full p-3 sm:p-4 rounded-xl border border-border bg-background hover:bg-muted/50 hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-left"
+                  >
+                    <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center font-mono font-bold text-sm shrink-0 bg-blue-500/10 text-blue-500">
                       {label[0]}
                     </div>
                     <div className="min-w-0">

@@ -82,7 +82,7 @@ export default function DemoPage() {
       // Deploy/get smart account for this user
       setState("deploying");
 
-      const deployResponse = await fetch("/api/smart-account", {
+      const deployResponse = await fetch("/api/smart-account/factory", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ publicKeyHex: pubkeyHex }),
@@ -248,8 +248,15 @@ export default function DemoPage() {
     }
   };
 
-  const COUNTER_ADDRESS = "CBRCNPTZ7YPP5BCGF42QSUWPYZQW6OJDPNQ4HDEYO7VI5Z6AVWWNEZ2U";
-  const VERIFIER_ADDRESS = "CBNCF7QBTMIAEIZ3H6EN6JU5RDLBTFZZKGSWPAXW6PGPNY3HHIW5HKCH";
+  const COUNTER_ADDRESS =
+    process.env.NEXT_PUBLIC_COUNTER_ADDRESS ||
+    "CBRCNPTZ7YPP5BCGF42QSUWPYZQW6OJDPNQ4HDEYO7VI5Z6AVWWNEZ2U";
+  const VERIFIER_ADDRESS =
+    process.env.NEXT_PUBLIC_VERIFIER_ADDRESS ||
+    "CAD6GFOCK2ISL7TA6QAZFY4QICS2AWSETXIKIACNSCPGXGOK7WOIME4U";
+  const FACTORY_ADDRESS =
+    process.env.NEXT_PUBLIC_FACTORY_ADDRESS ||
+    "CABA6ERCFZRZXZV5EYQCFB5AQMHMAIEOB5TCN7JWHMK3HWUZJCJNUZRR";
 
   return (
     <div className="min-h-svh bg-background">
@@ -333,6 +340,18 @@ export default function DemoPage() {
             <div className="mb-4 p-4 bg-muted/50 rounded-md space-y-2">
               <p className="text-xs text-muted-foreground font-semibold mb-2">On-Chain Contracts (verify on Stellar Expert)</p>
               <div className="flex items-center justify-between">
+                <span className="text-xs text-muted-foreground">Account Factory</span>
+                <a
+                  href={`https://stellar.expert/explorer/testnet/contract/${FACTORY_ADDRESS}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 font-mono text-xs text-blue-600 hover:underline"
+                >
+                  {FACTORY_ADDRESS.slice(0, 8)}...{FACTORY_ADDRESS.slice(-6)}
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+              <div className="flex items-center justify-between">
                 <span className="text-xs text-muted-foreground">Counter Contract</span>
                 <a
                   href={`https://stellar.expert/explorer/testnet/contract/${COUNTER_ADDRESS}`}
@@ -413,16 +432,26 @@ export default function DemoPage() {
           {/* Action Buttons */}
           <div className="flex flex-col gap-3">
             {state === "disconnected" && (
-              <Button
-                onClick={connectAndDeploy}
-                size="lg"
-                className="w-full font-mono"
-                disabled={!isPhantomAvailable}
-              >
-                {isPhantomAvailable
-                  ? "Connect Phantom & Create Smart Account"
-                  : "Install Phantom Wallet"}
-              </Button>
+              <>
+                <Button
+                  onClick={connectAndDeploy}
+                  size="lg"
+                  className="w-full font-mono"
+                  disabled={!isPhantomAvailable}
+                >
+                  {isPhantomAvailable
+                    ? "Connect Phantom & Create Smart Account"
+                    : "Phantom Not Detected"}
+                </Button>
+                {!isPhantomAvailable && (
+                  <a
+                    href="/smart-accounts"
+                    className="w-full flex items-center justify-center px-4 py-3 rounded-md border border-border bg-background hover:bg-muted/50 font-mono text-sm transition-colors"
+                  >
+                    Use Freighter (Stellar wallet) instead →
+                  </a>
+                )}
+              </>
             )}
 
             {(state === "ready" || state === "success") && (
@@ -510,4 +539,3 @@ export default function DemoPage() {
     </div>
   );
 }
-
