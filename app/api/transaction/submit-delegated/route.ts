@@ -9,6 +9,14 @@ import {
   Operation,
   Keypair,
 } from "@stellar/stellar-sdk";
+import {
+  addressStringFromCredentials,
+  classifyAuthEntryRole,
+  credentialSwitchName,
+  normalizeAuthEntries,
+  rootInvocationSummary,
+} from "@/lib/soroban-auth-entries";
+import { applyNativeEd25519ToAddressCredentials } from "@/lib/native-soroban-address-signature";
 
 const getConfig = () => ({
   rpcUrl: process.env.NEXT_PUBLIC_RPC_URL || "https://soroban-testnet.stellar.org",
@@ -29,8 +37,41 @@ async function fundAccountIfNeeded(gAddress: string): Promise<void> {
   }
 }
 
+function invokeAuthFromTx(tx: Transaction): xdr.SorobanAuthorizationEntry[] {
+  const origOp = tx.operations[0] as Operation.InvokeHostFunction;
+  const raw = (origOp.auth ?? []) as unknown[];
+  return normalizeAuthEntries(raw);
+}
+
+function buildDelegatedSignaturesScVal(
+  signerG: string,
+  contextRuleId: number,
+  sigBytes: Buffer
+): xdr.ScVal {
+  const signerKey = xdr.ScVal.scvVec([
+    xdr.ScVal.scvSymbol("Delegated"),
+    Address.fromString(signerG).toScVal(),
+  ]);
+  return xdr.ScVal.scvMap([
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol("context_rule_ids"),
+      val: xdr.ScVal.scvVec([xdr.ScVal.scvU32(contextRuleId)]),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol("signers"),
+      val: xdr.ScVal.scvMap([
+        new xdr.ScMapEntry({
+          key: signerKey,
+          val: xdr.ScVal.scvBytes(sigBytes),
+        }),
+      ]),
+    }),
+  ]);
+}
+
 /**
- * Submits a tx with Soroban auth entries already signed client-side (delegated/native scheme).
+ * Submits a tx with Soroban auth: native G rows (Freighter signBlob on per-entry Soroban payload hash) +
+ * custom smart-account Signatures.
  * Server acts as fee-payer: Enforcing-mode simulate, assemble, sign envelope, submit.
  */
 export async function POST(request: NextRequest) {
@@ -41,63 +82,194 @@ export async function POST(request: NextRequest) {
 
   try {
     const server = new rpc.Server(config.rpcUrl);
-    const { txXdr, authEntriesXdr } = await request.json();
+    const body = await request.json();
+    const {
+      txXdr,
+      signedAuthEntryXdr,
+      authEntryXdr,
+      signatureBase64,
+      signerG,
+      contextRuleId,
+      signedDelegatedAuthEntries,
+      smartAccountAuthEntryIndex,
+      smartAccountAddress,
+    } = body;
 
-    if (!txXdr || !Array.isArray(authEntriesXdr) || authEntriesXdr.length < 1) {
-      return NextResponse.json({ error: "Missing required parameters (txXdr, authEntriesXdr[])" }, { status: 400 });
+    if (!txXdr) {
+      return NextResponse.json({ error: "Missing txXdr." }, { status: 400 });
+    }
+
+    if (typeof txXdr !== "string" || txXdr.length < 50) {
+      return NextResponse.json(
+        { error: `txXdr must be a base64 XDR string (got ${typeof txXdr}, len=${String(txXdr).length})` },
+        { status: 400 }
+      );
     }
 
     const tx = TransactionBuilder.fromXDR(txXdr, config.networkPassphrase) as Transaction;
+    const opAuth = invokeAuthFromTx(tx);
 
-    const authEntries = authEntriesXdr.map((b64: string) =>
-      xdr.SorobanAuthorizationEntry.fromXDR(b64, "base64")
-    );
+    const useMergedVector =
+      typeof smartAccountAuthEntryIndex === "number" &&
+      Number.isInteger(smartAccountAuthEntryIndex) &&
+      smartAccountAuthEntryIndex >= 0 &&
+      typeof signatureBase64 === "string" &&
+      Array.isArray(signedDelegatedAuthEntries);
 
-    // Basic sanity checks: if a delegated signer auth entry is included, it must contain non-empty signature bytes.
-    // This helps catch "signed auth entry was never produced" errors early.
-    const getSignatureLen = (entry: xdr.SorobanAuthorizationEntry): number => {
-      try {
-        const creds = entry.credentials();
-        if (creds.switch().name !== "sorobanCredentialsAddress") return 0;
-        const sig = creds.address().signature();
-        if (sig.switch().name !== "scvVec") return 0;
-        const vec = sig.vec();
-        if (!vec || vec.length === 0) return 0;
-        const first = vec[0];
-        if (first.switch().name !== "scvMap") return 0;
-        const map = first.map();
-        if (!map) return 0;
-        for (const ent of map) {
-          const k = ent.key();
-          const v = ent.val();
-          if (k.switch().name === "scvSymbol" && k.sym().toString() === "signature") {
-            if (v.switch().name === "scvBytes") return v.bytes().length;
-          }
-        }
-      } catch {
-        // ignore
+    const useLegacySingle =
+      !useMergedVector &&
+      (signedAuthEntryXdr || (authEntryXdr && signatureBase64));
+
+    if (!useMergedVector && !useLegacySingle) {
+      return NextResponse.json(
+        {
+          error:
+            "Missing parameters. Send (txXdr, smartAccountAuthEntryIndex, signatureBase64, signedDelegatedAuthEntries) " +
+            "or legacy (txXdr, signedAuthEntryXdr) or (txXdr, authEntryXdr, signatureBase64).",
+        },
+        { status: 400 }
+      );
+    }
+
+    let mergedAuth: xdr.SorobanAuthorizationEntry[];
+
+    if (useMergedVector) {
+      if (opAuth.length === 0) {
+        return NextResponse.json(
+          { error: "Transaction invoke operation has no auth vector; rebuild with /api/transaction/build." },
+          { status: 400 }
+        );
       }
-      return 0;
-    };
+      if (smartAccountAuthEntryIndex >= opAuth.length) {
+        return NextResponse.json(
+          { error: `smartAccountAuthEntryIndex ${smartAccountAuthEntryIndex} out of range (auth length ${opAuth.length}).` },
+          { status: 400 }
+        );
+      }
 
-    // Any auth entry whose address is a G... (delegated signer) should have a non-empty signature.
-    for (const entry of authEntries) {
-      try {
-        const creds = entry.credentials();
-        if (creds.switch().name !== "sorobanCredentialsAddress") continue;
-        const addrStr = Address.fromScAddress(creds.address().address()).toString();
-        if (addrStr.startsWith("G")) {
-          const len = getSignatureLen(entry);
-          if (len <= 0) {
-            return NextResponse.json(
-              { error: "Delegated signer auth entry has empty signature bytes. Wallet did not sign auth entry." },
-              { status: 400 }
+      if (!signerG || typeof signerG !== "string" || !signerG.startsWith("G")) {
+        return NextResponse.json({ error: "Missing signerG (expected Stellar G... address) for delegated signer." }, { status: 400 });
+      }
+
+      const sigBytes = Buffer.from(String(signatureBase64), "base64");
+      if (sigBytes.length !== 64) {
+        return NextResponse.json(
+          { error: `signatureBase64 must decode to 64 bytes (got ${sigBytes.length}).` },
+          { status: 400 }
+        );
+      }
+
+      const id = typeof contextRuleId === "number" ? contextRuleId : Number(contextRuleId ?? 0);
+      mergedAuth = opAuth.map((e) => xdr.SorobanAuthorizationEntry.fromXDR(e.toXDR()));
+
+      for (const patch of signedDelegatedAuthEntries as {
+        index?: unknown;
+        signedAuthEntryXdr?: unknown;
+        nativeEd25519SignatureBase64?: unknown;
+      }[]) {
+        const idx = typeof patch.index === "number" ? patch.index : Number(patch.index);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= mergedAuth.length) {
+          return NextResponse.json({ error: `Invalid delegated auth patch index: ${patch.index}` }, { status: 400 });
+        }
+        const xdrStr = patch.signedAuthEntryXdr;
+        const nativeSig = patch.nativeEd25519SignatureBase64;
+        const hasXdr = typeof xdrStr === "string" && xdrStr.length >= 20;
+        const hasNative = typeof nativeSig === "string" && nativeSig.length >= 20;
+        if (hasXdr === hasNative) {
+          return NextResponse.json(
+            {
+              error:
+                "Each signedDelegatedAuthEntries item must include exactly one of: signedAuthEntryXdr (full entry) or nativeEd25519SignatureBase64 (Freighter signBlob output).",
+            },
+            { status: 400 }
+          );
+        }
+        if (hasXdr) {
+          mergedAuth[idx] = xdr.SorobanAuthorizationEntry.fromXDR(String(xdrStr), "base64");
+        } else {
+          const entryClone = xdr.SorobanAuthorizationEntry.fromXDR(mergedAuth[idx].toXDR());
+          try {
+            applyNativeEd25519ToAddressCredentials(
+              entryClone,
+              String(nativeSig),
+              config.networkPassphrase
             );
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return NextResponse.json({ error: `Delegated native signature (index ${idx}): ${msg}` }, { status: 400 });
           }
+          mergedAuth[idx] = entryClone;
         }
-      } catch {
-        // ignore
       }
+
+      const smartEntry = xdr.SorobanAuthorizationEntry.fromXDR(mergedAuth[smartAccountAuthEntryIndex].toXDR());
+      const creds = smartEntry.credentials();
+      if (creds.switch().name !== "sorobanCredentialsAddress") {
+        return NextResponse.json({ error: "Smart account auth entry credentials must be address-based" }, { status: 400 });
+      }
+      creds.address().signature(buildDelegatedSignaturesScVal(signerG, id, sigBytes));
+      mergedAuth[smartAccountAuthEntryIndex] = smartEntry;
+
+      const signerGStr = signerG;
+      const saAddr =
+        typeof smartAccountAddress === "string" && smartAccountAddress.startsWith("C")
+          ? smartAccountAddress
+          : null;
+
+      if (process.env.DEBUG_SOROBAN_AUTH === "1") {
+        console.log(
+          "[DEBUG_SOROBAN_AUTH] submit-delegated: mergedAuthLen=%s smartAccountIndex=%s delegatedPatches=%s",
+          mergedAuth.length,
+          smartAccountAuthEntryIndex,
+          signedDelegatedAuthEntries.length
+        );
+        mergedAuth.forEach((e, i) => {
+          const credAddr = addressStringFromCredentials(e);
+          const role = saAddr ? classifyAuthEntryRole(e, saAddr, signerGStr) : "other";
+          console.log(
+            "[DEBUG_SOROBAN_AUTH] submit-delegated merged[%s] credential=%s credAddress=%s root=%s role=%s",
+            i,
+            credentialSwitchName(e),
+            credAddr ?? "(none)",
+            rootInvocationSummary(e),
+            role
+          );
+        });
+      }
+    } else {
+      // Legacy: single auth entry on the invoke op (or replace entire op auth with one entry).
+      let authEntry: xdr.SorobanAuthorizationEntry;
+      if (signedAuthEntryXdr) {
+        authEntry = xdr.SorobanAuthorizationEntry.fromXDR(String(signedAuthEntryXdr), "base64");
+      } else {
+        authEntry = xdr.SorobanAuthorizationEntry.fromXDR(String(authEntryXdr), "base64");
+        const sigBytes = Buffer.from(String(signatureBase64), "base64");
+        if (sigBytes.length !== 64) {
+          const preview = String(signatureBase64);
+          const shortPreview = preview.length > 32 ? `${preview.slice(0, 32)}…` : preview;
+          return NextResponse.json(
+            {
+              error:
+                `signatureBase64 must decode to 64 bytes (got ${sigBytes.length}). ` +
+                `signatureBase64.len=${String(signatureBase64).length} preview=${shortPreview}`,
+            },
+            { status: 400 }
+          );
+        }
+
+        if (!signerG || typeof signerG !== "string" || !signerG.startsWith("G")) {
+          return NextResponse.json({ error: "Missing signerG (expected Stellar G... address) for delegated signer." }, { status: 400 });
+        }
+
+        const id = typeof contextRuleId === "number" ? contextRuleId : Number(contextRuleId ?? 0);
+        const creds = authEntry.credentials();
+        if (creds.switch().name !== "sorobanCredentialsAddress") {
+          return NextResponse.json({ error: "Auth entry credentials must be address-based" }, { status: 400 });
+        }
+        creds.address().signature(buildDelegatedSignaturesScVal(signerG, id, sigBytes));
+      }
+
+      mergedAuth = [authEntry];
     }
 
     const env = tx.toEnvelope();
@@ -124,20 +296,24 @@ export async function POST(request: NextRequest) {
       Operation.invokeHostFunction({
         source: origOp.source,
         func: origOp.func,
-        auth: authEntries,
+        auth: mergedAuth,
       })
     );
     const txWithAuth = tb.build();
 
     const enforcingSim = await server.simulateTransaction(txWithAuth);
     if (rpc.Api.isSimulationError(enforcingSim)) {
-      return NextResponse.json({ error: `Auth validation failed: ${enforcingSim.error}` }, { status: 400 });
+      return NextResponse.json(
+        {
+          error: `Auth validation failed: ${enforcingSim.error}`,
+        },
+        { status: 400 }
+      );
     }
 
     const assembledTx = rpc.assembleTransaction(txWithAuth, enforcingSim).build();
     const bundlerKeypair = Keypair.fromSecret(config.bundlerSecret);
 
-    // Ensure fee-payer exists on testnet (fresh envs commonly need friendbot).
     try {
       await server.getAccount(bundlerKeypair.publicKey());
     } catch (e: any) {
@@ -177,4 +353,3 @@ export async function POST(request: NextRequest) {
     );
   }
 }
-

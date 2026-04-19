@@ -37,7 +37,7 @@ function deriveSalt(publicKeyHex: string): Buffer {
 
 // Shared: builds the AccountInitParams ScVal map
 function buildParamsMap(publicKeyHex: string, salt: Buffer): xdr.ScVal {
-  const signerStruct = xdr.ScVal.scvMap([
+  const externalSignerInit = xdr.ScVal.scvMap([
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("key_data"),
       val: xdr.ScVal.scvBytes(Buffer.from(publicKeyHex, "hex")),
@@ -49,6 +49,13 @@ function buildParamsMap(publicKeyHex: string, salt: Buffer): xdr.ScVal {
     }),
   ]);
 
+  // New factory ABI expects AccountSignerInit enum:
+  // AccountSignerInit::External(ExternalSignerInit) encodes as ScVec([Symbol("External"), <ExternalSignerInit>]).
+  const accountSignerInit = xdr.ScVal.scvVec([
+    xdr.ScVal.scvSymbol("External"),
+    externalSignerInit,
+  ]);
+
   return xdr.ScVal.scvMap([
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("account_salt"),
@@ -56,7 +63,7 @@ function buildParamsMap(publicKeyHex: string, salt: Buffer): xdr.ScVal {
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("signers"),
-      val: xdr.ScVal.scvVec([signerStruct]),
+      val: xdr.ScVal.scvVec([accountSignerInit]),
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("threshold"),

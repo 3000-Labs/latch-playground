@@ -109,72 +109,244 @@ export default function SmartAccountsPage() {
     setTxHash(null);
 
     try {
-      // 3a. Build tx & get auth digest (same path for Phantom + Freighter: external Ed25519 smart account)
+      // 3a. Build tx & get auth digest
+      const buildBody: Record<string, string> = { smartAccountAddress: smartAccountAddr };
+      if (wallet.walletType === "freighter" && wallet.gAddress) {
+        buildBody.signerG = wallet.gAddress;
+      }
       const buildRes = await fetch("/api/transaction/build", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ smartAccountAddress: smartAccountAddr }),
+        body: JSON.stringify(buildBody),
       });
       const build = await buildRes.json();
       if (!buildRes.ok) throw new Error(build.error ?? "Build failed.");
-      const { txXdr, authEntryXdr, authDigestHex } = build;
+      const {
+        txXdr,
+        authEntryXdr,
+        authEntriesXdr,
+        authDigestHex,
+        authDigestBase64,
+        contextRuleId,
+        smartAccountAuthEntryIndex,
+        delegatedNativeAuthEntryIndices,
+        delegatedNativeSignBlobPayloadsBase64,
+      } = build;
 
-      const signPrefixedMessage = async (hashHex: string) => {
-        const normalizedHash = hashHex.toLowerCase();
-        const prefixedMessage = AUTH_PREFIX + normalizedHash;
-
-        if (wallet.walletType === "phantom") {
-          const messageBytes = new TextEncoder().encode(prefixedMessage);
-          const provider = (window as any).phantom?.solana;
-          if (!provider) throw new Error("Phantom not found.");
-          const result = await provider.signMessage(messageBytes, "utf8");
-          const authSignatureHex = Buffer.from(result.signature).toString("hex");
-          return { prefixedMessage, authSignatureHex };
+      // 3b. Sign + submit
+      setTxState("signing");
+      if (wallet.walletType === "freighter") {
+        const signerG = wallet.gAddress;
+        if (!signerG) throw new Error("Missing Freighter public key (G-address). Reconnect wallet.");
+        if (!authEntryXdr || typeof authEntryXdr !== "string") {
+          throw new Error("Missing authEntryXdr from build response.");
+        }
+        if (!Array.isArray(authEntriesXdr) || authEntriesXdr.length === 0) {
+          throw new Error("Missing authEntriesXdr from build response.");
+        }
+        if (typeof smartAccountAuthEntryIndex !== "number" || smartAccountAuthEntryIndex < 0) {
+          throw new Error("Missing smartAccountAuthEntryIndex from build response.");
+        }
+        if (!authDigestBase64 || typeof authDigestBase64 !== "string") {
+          throw new Error("Missing authDigestBase64 from build response.");
+        }
+        if (!txXdr || typeof txXdr !== "string") {
+          throw new Error("Missing txXdr from build response.");
         }
 
-        if (wallet.walletType === "freighter") {
-          const signerG = wallet.gAddress;
-          if (!signerG) throw new Error("Missing Freighter public key (G-address). Reconnect wallet.");
-          const payloadB64 = Buffer.from(prefixedMessage, "utf8").toString("base64");
-          const sigB64 = await signBlob(payloadB64, { accountToSign: signerG });
-          const sigBytes = Buffer.from(sigB64, "base64");
-          if (sigBytes.length !== 64) {
-            throw new Error(`Freighter signBlob must return a 64-byte Ed25519 signature (got ${sigBytes.length}).`);
+        const normalizeFreighterResultToString = (v: unknown): string => {
+          if (typeof v === "string") return v;
+          if (v && typeof v === "object" && (v as { type?: string }).type === "Buffer" && Array.isArray((v as { data?: unknown }).data)) {
+            return Buffer.from((v as { data: number[] }).data).toString("base64");
           }
-          return { prefixedMessage, authSignatureHex: sigBytes.toString("hex") };
+          if (v && typeof v === "object" && typeof (v as { signedBlob?: string }).signedBlob === "string") {
+            return (v as { signedBlob: string }).signedBlob;
+          }
+          return String(v);
+        };
+
+        if (process.env.NEXT_PUBLIC_DEBUG_SOROBAN_AUTH === "1") {
+          const indices: number[] = Array.isArray(delegatedNativeAuthEntryIndices)
+            ? delegatedNativeAuthEntryIndices
+            : [];
+          console.log(
+            "[NEXT_PUBLIC_DEBUG_SOROBAN_AUTH] build auth count=%s smartAccountIndex=%s delegatedIndices=%s signerG=%s",
+            authEntriesXdr.length,
+            smartAccountAuthEntryIndex,
+            JSON.stringify(indices),
+            signerG
+          );
         }
 
-        throw new Error(`Unsupported wallet type for signing: ${wallet.walletType}`);
-      };
+        const delegatedIndices: number[] = Array.isArray(delegatedNativeAuthEntryIndices)
+          ? delegatedNativeAuthEntryIndices
+          : [];
+        const delegatedPayloads: string[] = Array.isArray(delegatedNativeSignBlobPayloadsBase64)
+          ? delegatedNativeSignBlobPayloadsBase64
+          : [];
+        if (delegatedIndices.length !== delegatedPayloads.length) {
+          throw new Error(
+            `Build response mismatch: delegatedNativeAuthEntryIndices (${delegatedIndices.length}) vs delegatedNativeSignBlobPayloadsBase64 (${delegatedPayloads.length}).`
+          );
+        }
 
-      const submitOnce = async (authSignatureHex: string, prefixedMessage: string) => {
-        const submitRes = await fetch("/api/transaction/submit", {
+        const extractSigBase64 = (freighterResult: string): string => {
+          // Expected happy-path: base64(64 bytes)
+          const direct = Buffer.from(freighterResult, "base64");
+          if (direct.length === 64) return freighterResult;
+
+          // Some wallet versions may return wrapped data. Try decoding once as UTF-8.
+          let decodedUtf8: string | null = null;
+          try {
+            decodedUtf8 = direct.toString("utf8");
+          } catch {
+            decodedUtf8 = null;
+          }
+
+          const tryCandidate = (candidate: unknown): string | null => {
+            if (typeof candidate !== "string") return null;
+            // candidate itself might be base64(64 bytes)
+            const b = Buffer.from(candidate, "base64");
+            if (b.length === 64) return candidate;
+            // candidate might be hex(64 bytes)
+            if (/^[0-9a-fA-F]{128}$/.test(candidate)) {
+              const hx = Buffer.from(candidate, "hex");
+              if (hx.length === 64) return hx.toString("base64");
+            }
+            return null;
+          };
+
+          // If decodedUtf8 looks like base64, try it.
+          if (decodedUtf8) {
+            const nested = tryCandidate(decodedUtf8.trim());
+            if (nested) return nested;
+          }
+
+          // If decodedUtf8 is JSON, search for a signature-ish field.
+          if (decodedUtf8) {
+            try {
+              const obj = JSON.parse(decodedUtf8);
+              const stack: unknown[] = [obj];
+              while (stack.length) {
+                const cur = stack.pop();
+                const found = tryCandidate(cur);
+                if (found) return found;
+                if (cur && typeof cur === "object") {
+                  for (const v of Object.values(cur as Record<string, unknown>)) stack.push(v);
+                }
+              }
+            } catch {
+              // ignore
+            }
+          }
+
+          const preview = freighterResult.length > 24 ? `${freighterResult.slice(0, 24)}…` : freighterResult;
+          throw new Error(
+            `Freighter signBlob returned an unexpected value (base64→${direct.length} bytes). ` +
+              `Cannot extract a 64-byte signature. resultPreview=${preview}`
+          );
+        };
+
+        // Per delegated G row: Freighter `signBlob` on the 32-byte Soroban auth payload for that entry (not `signAuthEntry`, which triggers Freighter "Bad union switch").
+        const signedDelegatedAuthEntries: {
+          index: number;
+          nativeEd25519SignatureBase64: string;
+        }[] = [];
+        for (let d = 0; d < delegatedIndices.length; d++) {
+          const idx = delegatedIndices[d];
+          const payloadB64 = delegatedPayloads[d];
+          if (typeof payloadB64 !== "string" || payloadB64.length < 20) {
+            throw new Error(`Missing delegated native sign payload at build position ${d} (auth index ${idx}).`);
+          }
+          const nativeSignRaw: unknown = await signBlob(payloadB64, { accountToSign: signerG });
+          const nativeStr = normalizeFreighterResultToString(nativeSignRaw);
+          const nativeSigB64 = extractSigBase64(nativeStr);
+          const nativeSigBytes = Buffer.from(nativeSigB64, "base64");
+          if (nativeSigBytes.length !== 64) {
+            throw new Error(
+              `Freighter signBlob (delegated row index ${idx}) did not produce a 64-byte signature (got ${nativeSigBytes.length}).`
+            );
+          }
+          signedDelegatedAuthEntries.push({ index: idx, nativeEd25519SignatureBase64: nativeSigB64 });
+        }
+
+        // Custom-account `Signatures` on the smart account contract entry: sign digest (hashSorobanAuthPayload || context_rule_ids).
+        const freighterResult: unknown = await signBlob(authDigestBase64, { accountToSign: signerG });
+        const frString = normalizeFreighterResultToString(freighterResult);
+        const sigB64 = extractSigBase64(frString);
+        const sigBytes = Buffer.from(sigB64, "base64");
+        if (sigBytes.length !== 64) {
+          throw new Error(`Freighter signBlob did not produce a 64-byte signature (got ${sigBytes.length}).`);
+        }
+
+        setTxState("submitting");
+        const submitRes = await fetch("/api/transaction/submit-delegated", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            txXdr,
+            smartAccountAuthEntryIndex,
+            signatureBase64: sigB64,
+            signerG,
+            contextRuleId,
+            signedDelegatedAuthEntries,
+            smartAccountAddress: smartAccountAddr,
+          }),
+        });
+        const submitData = await submitRes.json();
+        if (!submitRes.ok) {
+          throw new Error(submitData?.error ?? "Submit failed.");
+        }
+
+        setTxHash(submitData.hash);
+        setTxState("success");
+        await fetchCounter();
+        return;
+      }
+
+      // Phantom: keep existing external-verifier flow
+      const normalizedHash = String(authDigestHex).toLowerCase();
+      const prefixedMessage = AUTH_PREFIX + normalizedHash;
+      const messageBytes = new TextEncoder().encode(prefixedMessage);
+      const provider = (window as any).phantom?.solana;
+      if (!provider) throw new Error("Phantom not found.");
+      const result = await provider.signMessage(messageBytes, "utf8");
+      const authSignatureHex = Buffer.from(result.signature).toString("hex");
+
+      setTxState("submitting");
+      let submitRes = await fetch("/api/transaction/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          txXdr,
+          authEntryXdr,
+          authSignatureHex,
+          prefixedMessage,
+          publicKeyHex: wallet.publicKeyHex,
+        }),
+      });
+      let submitData = await submitRes.json();
+
+      if (!submitRes.ok && submitData?.verifierHashHex && typeof submitData.verifierHashHex === "string") {
+        setTxState("signing");
+        const normalized = String(submitData.verifierHashHex).toLowerCase();
+        const retryMsg = AUTH_PREFIX + normalized;
+        const retryBytes = new TextEncoder().encode(retryMsg);
+        const retry = await provider.signMessage(retryBytes, "utf8");
+        const retrySigHex = Buffer.from(retry.signature).toString("hex");
+        setTxState("submitting");
+        submitRes = await fetch("/api/transaction/submit", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             txXdr,
             authEntryXdr,
-            authSignatureHex,
-            prefixedMessage,
+            authSignatureHex: retrySigHex,
+            prefixedMessage: retryMsg,
             publicKeyHex: wallet.publicKeyHex,
           }),
         });
-        const submitData = await submitRes.json();
-        return { submitRes, submitData };
-      };
-
-      // 3b. Sign + submit (retry once with verifier hash if provided)
-      setTxState("signing");
-      const first = await signPrefixedMessage(authDigestHex);
-
-      setTxState("submitting");
-      let { submitRes, submitData } = await submitOnce(first.authSignatureHex, first.prefixedMessage);
-
-      if (!submitRes.ok && submitData?.verifierHashHex && typeof submitData.verifierHashHex === "string") {
-        setTxState("signing");
-        const second = await signPrefixedMessage(submitData.verifierHashHex);
-        setTxState("submitting");
-        ({ submitRes, submitData } = await submitOnce(second.authSignatureHex, second.prefixedMessage));
+        submitData = await submitRes.json();
       }
 
       if (!submitRes.ok) {

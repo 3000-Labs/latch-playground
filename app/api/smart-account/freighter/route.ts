@@ -55,20 +55,13 @@ function deriveFactorySalt(publicKeyHex: string): Buffer {
 }
 
 /**
- * Same `AccountInitParams` encoding as the factory route: External Ed25519 (key_data + signer_kind).
- * The deployed Latch factory expects this shape; `Delegated(G...)` vec encoding traps the VM.
+ * Delegated signer encoding for Freighter:
+ * AccountSignerInit::Delegated(Address) encodes as ScVec([Symbol("Delegated"), scvAddress]).
  */
-function buildAccountInitParamsMap(publicKeyHex: string, salt: Buffer): xdr.ScVal {
-  const normalizedPubkeyHex = publicKeyHex.toLowerCase();
-  const signerStruct = xdr.ScVal.scvMap([
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("key_data"),
-      val: xdr.ScVal.scvBytes(Buffer.from(normalizedPubkeyHex, "hex")),
-    }),
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("signer_kind"),
-      val: xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Ed25519")]),
-    }),
+function buildAccountInitParamsMap(gAddress: string, salt: Buffer): xdr.ScVal {
+  const delegatedSigner = xdr.ScVal.scvVec([
+    xdr.ScVal.scvSymbol("Delegated"),
+    Address.fromString(gAddress).toScVal(),
   ]);
 
   return xdr.ScVal.scvMap([
@@ -78,7 +71,7 @@ function buildAccountInitParamsMap(publicKeyHex: string, salt: Buffer): xdr.ScVa
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("signers"),
-      val: xdr.ScVal.scvVec([signerStruct]),
+      val: xdr.ScVal.scvVec([delegatedSigner]),
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("threshold"),
@@ -133,7 +126,7 @@ export async function GET(request: NextRequest) {
     void bundlerKeypair; // bundler only used for POST; keep creation consistent with factory route behavior
     const pubkeyHex = pubkeyHexFromGAddress(gAddress);
     const salt = deriveFactorySalt(pubkeyHex);
-    const paramsMap = buildAccountInitParamsMap(pubkeyHex, salt);
+    const paramsMap = buildAccountInitParamsMap(gAddress, salt);
     const predictedAddress = await getFactoryPredictedAddress(paramsMap);
 
     const server = new rpc.Server(config.rpcUrl);
@@ -187,7 +180,7 @@ export async function POST(request: NextRequest) {
 
     const pubkeyHex = pubkeyHexFromGAddress(gAddress);
     const salt = deriveFactorySalt(pubkeyHex);
-    const paramsMap = buildAccountInitParamsMap(pubkeyHex, salt);
+    const paramsMap = buildAccountInitParamsMap(gAddress, salt);
 
     const server = new rpc.Server(TESTNET_CONFIG.rpcUrl);
     const bundlerKeypair = Keypair.fromSecret(TESTNET_CONFIG.bundlerSecret);
