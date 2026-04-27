@@ -7,11 +7,9 @@ import {
   WalletConnectionResult,
 } from "@/lib/wallets";
 import {
-  registerPasskey,
   signWithPasskey,
   computeAuthDigest,
   encodeWebAuthnSigData,
-  type PasskeyRegistration,
 } from "@/lib/webauthn";
 import { signAuthEntry } from "@stellar/freighter-api";
 import { xdr, Networks } from "@stellar/stellar-sdk";
@@ -26,7 +24,6 @@ import {
   ArrowRight,
   Fingerprint,
 } from "lucide-react";
-import { signBlob } from "@stellar/freighter-api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -46,6 +43,17 @@ type TxState =
   | "success"
   | "error";
 type ActiveMode = "wallet" | "passkey" | null;
+
+type PasskeySession = {
+  credentialId: string;
+  keyDataHex: string;
+};
+
+type AccountRow = {
+  smartAccountAddress: string;
+  credentialId: string;
+  deployed: boolean;
+};
 
 const COUNTER_ADDRESS =
   process.env.NEXT_PUBLIC_COUNTER_ADDRESS ||
@@ -73,8 +81,10 @@ export default function SmartAccountsPage() {
 
   // Passkey (WebAuthn) state
   const [passkeyState, setPasskeyState] = useState<PasskeyState>("idle");
-  const [passkey, setPasskey] = useState<PasskeyRegistration | null>(null);
+  const [passkeySession, setPasskeySession] = useState<PasskeySession | null>(null);
   const [passkeyError, setPasskeyError] = useState<string | null>(null);
+  const [accounts, setAccounts] = useState<AccountRow[]>([]);
+  const [activeAccount, setActiveAccount] = useState<string | null>(null);
 
   // Shared
   const [activeMode, setActiveMode] = useState<ActiveMode>(null);
@@ -89,6 +99,17 @@ export default function SmartAccountsPage() {
   useEffect(() => {
     fetchCounter();
   }, []);
+
+  const refreshAccounts = async () => {
+    try {
+      const res = await fetch("/api/accounts");
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.accounts)) setAccounts(data.accounts);
+    } catch {
+      /* silent */
+    }
+  };
 
   const fetchCounter = async () => {
     try {
@@ -106,8 +127,10 @@ export default function SmartAccountsPage() {
     setActiveMode("wallet");
     // Clear passkey state when switching to wallet
     setPasskeyState("idle");
-    setPasskey(null);
+    setPasskeySession(null);
     setPasskeyError(null);
+    setAccounts([]);
+    setActiveAccount(null);
     setSmartAccountAddr(null);
     try {
       const info = await connectWallet(type);
@@ -162,8 +185,8 @@ export default function SmartAccountsPage() {
     }
   };
 
-  // ── Passkey: Register + deploy ────────────────────────────────────────────
-  const handlePasskeyRegister = async () => {
+  // ── Passkey: Create account (registration) ────────────────────────────────
+  const handlePasskeyCreateAccount = async () => {
     setPasskeyState("registering");
     setPasskeyError(null);
     setActiveMode("passkey");
@@ -172,29 +195,98 @@ export default function SmartAccountsPage() {
     setWallet(null);
     setSetupError(null);
     setSmartAccountAddr(null);
+    setTxState("idle");
+    setTxHash(null);
+    setTxError(null);
     try {
-      const rpId = window.location.hostname;
-      const reg = await registerPasskey(rpId, "Latch", "user");
-      setPasskey(reg);
-
-      setPasskeyState("deploying");
-      const res = await fetch("/api/smart-account/webauthn", {
+      const beginRes = await fetch("/api/webauthn/registration/begin", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          keyDataHex: reg.keyData.toString("hex"),
-          credentialId: reg.credentialId,
-        }),
+        body: JSON.stringify({ displayName: "local-user" }),
       });
-      const data = await res.json();
-      if (!res.ok)
-        throw new Error(data.error || "Failed to deploy smart account");
-      setSmartAccountAddr(data.smartAccountAddress);
+      const begin = await beginRes.json();
+      if (!beginRes.ok) throw new Error(begin.error ?? "Failed to begin registration");
+
+      const { startRegistration } = await import("@simplewebauthn/browser");
+      const regResponse = await startRegistration({ optionsJSON: begin.options });
+
+      setPasskeyState("deploying");
+      const finishRes = await fetch("/api/webauthn/registration/finish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ response: regResponse }),
+      });
+      const finish = await finishRes.json();
+      if (!finishRes.ok) throw new Error(finish.error ?? "Failed to finish registration");
+
+      setPasskeySession({ credentialId: finish.credentialId, keyDataHex: finish.keyDataHex });
+      setSmartAccountAddr(finish.smartAccountAddress);
+      setActiveAccount(finish.smartAccountAddress);
+      await fetch("/api/accounts/set-active", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ smartAccountAddress: finish.smartAccountAddress }),
+      });
+      await refreshAccounts();
       setPasskeyState("ready");
     } catch (err: any) {
-      setPasskeyError(err.message ?? "Registration failed.");
+      setPasskeyError(err.message ?? "Create account failed.");
       setPasskeyState("error");
     }
+  };
+
+  // ── Passkey: Login (authentication) ───────────────────────────────────────
+  const handlePasskeyLogin = async () => {
+    setPasskeyState("registering");
+    setPasskeyError(null);
+    setActiveMode("passkey");
+    setSetupState("idle");
+    setWallet(null);
+    setSetupError(null);
+    setSmartAccountAddr(null);
+    setTxState("idle");
+    setTxHash(null);
+    setTxError(null);
+    try {
+      const beginRes = await fetch("/api/webauthn/authentication/begin", { method: "POST" });
+      const begin = await beginRes.json();
+      if (!beginRes.ok) throw new Error(begin.error ?? "Failed to begin login");
+
+      const { startAuthentication } = await import("@simplewebauthn/browser");
+      const authResponse = await startAuthentication({ optionsJSON: begin.options });
+
+      const finishRes = await fetch("/api/webauthn/authentication/finish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ response: authResponse }),
+      });
+      const finish = await finishRes.json();
+      if (!finishRes.ok) throw new Error(finish.error ?? "Failed to finish login");
+
+      setPasskeySession({ credentialId: finish.activeCredentialId, keyDataHex: finish.keyDataHex });
+      setSmartAccountAddr(finish.smartAccountAddress);
+      setActiveAccount(finish.smartAccountAddress);
+      await fetch("/api/accounts/set-active", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ smartAccountAddress: finish.smartAccountAddress }),
+      });
+      if (Array.isArray(finish.accounts)) setAccounts(finish.accounts);
+      setPasskeyState("ready");
+    } catch (err: any) {
+      setPasskeyError(err.message ?? "Login failed.");
+      setPasskeyState("error");
+    }
+  };
+
+  const handleSwitchAccount = async (smartAccountAddress: string) => {
+    setSmartAccountAddr(smartAccountAddress);
+    setActiveAccount(smartAccountAddress);
+    await fetch("/api/accounts/set-active", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ smartAccountAddress }),
+    });
   };
 
   // ── Increment counter ─────────────────────────────────────────────────────
@@ -205,7 +297,7 @@ export default function SmartAccountsPage() {
     setTxHash(null);
 
     try {
-      if (activeMode === "passkey" && passkey) {
+      if (activeMode === "passkey" && passkeySession) {
         // ── Passkey (WebAuthn P-256) path ───────────────────────────────────
         const buildRes = await fetch("/api/transaction/build", {
           method: "POST",
@@ -232,7 +324,7 @@ export default function SmartAccountsPage() {
 
         setTxState("signing");
         const sig = await signWithPasskey(
-          passkey.credentialId,
+          passkeySession.credentialId,
           authDigest,
           window.location.hostname,
         );
@@ -246,7 +338,7 @@ export default function SmartAccountsPage() {
             txXdr,
             authEntryXdr,
             sigDataXdr: sigDataXdr.toString("hex"),
-            keyDataHex: passkey.keyData.toString("hex"),
+            keyDataHex: passkeySession.keyDataHex,
             contextRuleId: 0,
           }),
         });
@@ -375,7 +467,7 @@ export default function SmartAccountsPage() {
       setTxError(err?.message ?? "Transaction failed.");
       setTxState("error");
     }
-  }, [wallet, passkey, smartAccountAddr, activeMode]);
+  }, [wallet, passkeySession, smartAccountAddr, activeMode]);
 
   const reset = () => {
     setSetupState("idle");
@@ -383,9 +475,11 @@ export default function SmartAccountsPage() {
     setSmartAccountAddr(null);
     setSetupError(null);
     setPasskeyState("idle");
-    setPasskey(null);
+    setPasskeySession(null);
     setPasskeyError(null);
     setActiveMode(null);
+    setAccounts([]);
+    setActiveAccount(null);
     setTxState("idle");
     setTxHash(null);
     setTxError(null);
@@ -548,34 +642,51 @@ export default function SmartAccountsPage() {
                 <p className="text-xs font-mono text-muted-foreground uppercase tracking-wider">
                   Device
                 </p>
-                <button
-                  onClick={handlePasskeyRegister}
-                  disabled={anySetupBusy}
-                  className="flex items-center gap-3 w-full p-3 sm:p-4 rounded-xl border border-border bg-background hover:bg-muted/50 hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-left"
-                >
-                  <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center shrink-0 bg-emerald-500/10 text-emerald-500">
-                    <Fingerprint className="w-5 h-5" />
-                  </div>
-                  <div className="min-w-0">
-                    <div className="font-mono text-sm font-medium truncate">
-                      Passkey
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    onClick={handlePasskeyCreateAccount}
+                    disabled={anySetupBusy}
+                    className="flex items-center gap-3 w-full p-3 sm:p-4 rounded-xl border border-border bg-background hover:bg-muted/50 hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-left"
+                  >
+                    <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center shrink-0 bg-emerald-500/10 text-emerald-500">
+                      <Fingerprint className="w-5 h-5" />
                     </div>
-                    <div className="text-xs text-muted-foreground truncate">
-                      {passkeyState === "registering"
-                        ? "Creating passkey…"
-                        : passkeyState === "deploying"
-                          ? "Deploying smart account…"
-                          : "Face ID / Touch ID / Hardware key"}
+                    <div className="min-w-0">
+                      <div className="font-mono text-sm font-medium truncate">
+                        Create account
+                      </div>
+                      <div className="text-xs text-muted-foreground truncate">
+                        {passkeyState === "registering"
+                          ? "Registering…"
+                          : passkeyState === "deploying"
+                            ? "Deploying…"
+                            : "New passkey → new account"}
+                      </div>
                     </div>
-                  </div>
-                  {passkeyState === "ready" && activeMode === "passkey" && (
-                    <CheckCircle className="w-4 h-4 text-primary ml-auto shrink-0" />
-                  )}
-                  {(passkeyState === "registering" ||
-                    passkeyState === "deploying") && (
-                    <Loader2 className="w-4 h-4 text-primary ml-auto shrink-0 animate-spin" />
-                  )}
-                </button>
+                    {(passkeyState === "registering" ||
+                      passkeyState === "deploying") && (
+                      <Loader2 className="w-4 h-4 text-primary ml-auto shrink-0 animate-spin" />
+                    )}
+                  </button>
+
+                  <button
+                    onClick={handlePasskeyLogin}
+                    disabled={anySetupBusy}
+                    className="flex items-center gap-3 w-full p-3 sm:p-4 rounded-xl border border-border bg-background hover:bg-muted/50 hover:border-primary/40 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-left"
+                  >
+                    <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center shrink-0 bg-primary/10 text-primary">
+                      <Fingerprint className="w-5 h-5" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-mono text-sm font-medium truncate">
+                        Login
+                      </div>
+                      <div className="text-xs text-muted-foreground truncate">
+                        Use existing passkey
+                      </div>
+                    </div>
+                  </button>
+                </div>
 
                 {/* Passkey error */}
                 {passkeyError && activeMode === "passkey" && (
@@ -714,6 +825,30 @@ export default function SmartAccountsPage() {
                       <ExternalLink className="w-3 h-3 shrink-0" />
                     </a>
                   </div>
+
+                  {/* Account switcher (passkey mode) */}
+                  {activeMode === "passkey" && accounts.length > 1 && (
+                    <div className="p-4 rounded-xl border bg-muted/20 space-y-2">
+                      <p className="text-xs font-mono text-muted-foreground uppercase tracking-wider">
+                        Switch account
+                      </p>
+                      <div className="space-y-2">
+                        {accounts.map((a) => (
+                          <button
+                            key={a.smartAccountAddress}
+                            onClick={() => handleSwitchAccount(a.smartAccountAddress)}
+                            className={`w-full text-left font-mono text-xs px-3 py-2 rounded-lg border transition-colors ${
+                              activeAccount === a.smartAccountAddress
+                                ? "border-primary/40 bg-primary/10"
+                                : "border-border bg-background hover:bg-muted/40"
+                            }`}
+                          >
+                            {a.smartAccountAddress}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   {/* Counter divider */}
                   <div className="flex items-center gap-3 text-muted-foreground/50">
