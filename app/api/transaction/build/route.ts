@@ -236,13 +236,13 @@ export async function POST(request: NextRequest) {
     const assembledTx = assembledBuilder.build();
 
     // signaturePayload is the Soroban auth payload hash (32 bytes).
-    const signaturePayload = hashSorobanAuthPayload(authEntry, TESTNET_CONFIG.networkPassphrase);
+    // const signaturePayload = hashSorobanAuthPayload(authEntry, TESTNET_CONFIG.networkPassphrase);
     // The current smart-account contract binds context_rule_ids into auth_digest
     // before calling the verifier, so external signers must sign authDigestHex.
     const ruleIdsXdr = xdr.ScVal.scvVec([xdr.ScVal.scvU32(0)]).toXDR();
     const authDigest = hash(Buffer.concat([signaturePayload, Buffer.from(ruleIdsXdr)]));
     const authDigestHex = authDigest.toString("hex");
-    const authDigestBase64 = authDigest.toString("base64");
+    // const authDigestBase64 = authDigest.toString("base64");
 
     // Handle transactionData - may be string, XDR object, or SorobanDataBuilder
     let transactionDataXdr: string | undefined;
