@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { generateRegistrationOptions } from "@simplewebauthn/server";
 import type { PublicKeyCredentialCreationOptionsJSON } from "@simplewebauthn/types";
-import { getDb, nowMs } from "@/lib/db";
+import { prisma } from "@/lib/prisma";
+import { nowMs } from "@/lib/db";
 import { getOrCreateSession } from "@/lib/session";
 import {
   getExpectedOriginFromRequest,
@@ -10,9 +11,10 @@ import {
 } from "@/lib/webauthn-server";
 import * as crypto from "crypto";
 
+export const runtime = "nodejs";
+
 export async function POST(request: Request) {
   try {
-    const db = getDb();
     const { userId } = await getOrCreateSession();
     const body = (await request.json().catch(() => ({}))) as { displayName?: string };
     const rpID = getRpIdFromRequest(request);
@@ -38,18 +40,18 @@ export async function POST(request: Request) {
 
     const now = nowMs();
     const expiresAt = now + 5 * 60 * 1000;
-    db.prepare(
-      "INSERT INTO webauthn_challenges (id, user_id, purpose, challenge, rp_id, origin, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(
-      crypto.randomUUID(),
-      userId,
-      "registration",
-      options.challenge,
-      rpID,
-      expectedOrigin,
-      expiresAt,
-      now
-    );
+    await prisma.webauthnChallenge.create({
+      data: {
+        id: crypto.randomUUID(),
+        userId,
+        purpose: "registration",
+        challenge: options.challenge,
+        rpId: rpID,
+        origin: expectedOrigin,
+        expiresAt: BigInt(expiresAt),
+        createdAt: BigInt(now),
+      },
+    });
 
     return NextResponse.json({ options });
   } catch (error) {
@@ -59,4 +61,3 @@ export async function POST(request: Request) {
     );
   }
 }
-

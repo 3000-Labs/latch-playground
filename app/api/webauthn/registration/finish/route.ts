@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { verifyRegistrationResponse } from "@simplewebauthn/server";
 import type { RegistrationResponseJSON } from "@simplewebauthn/types";
-import { getDb, nowMs } from "@/lib/db";
+import { prisma } from "@/lib/prisma";
+import { nowMs } from "@/lib/db";
 import { getOrCreateSession } from "@/lib/session";
 import {
   coseEc2ToRawP256Uncompressed,
@@ -9,7 +10,6 @@ import {
   getExpectedOriginFromRequest,
   getRpIdFromRequest,
   sha256Hex,
-  toBase64Url,
 } from "@/lib/webauthn-server";
 import {
   buildWebauthnAccountInitParams,
@@ -22,11 +22,12 @@ import {
 import { rpc } from "@stellar/stellar-sdk";
 import * as crypto from "crypto";
 
+export const runtime = "nodejs";
+
 type FinishBody = { response: RegistrationResponseJSON };
 
 export async function POST(request: Request) {
   try {
-    const db = getDb();
     const { userId } = await getOrCreateSession();
 
     const body = (await request.json()) as FinishBody;
@@ -38,19 +39,13 @@ export async function POST(request: Request) {
     const expectedOrigin = getExpectedOriginFromRequest(request);
     const now = nowMs();
 
-    const challengeRow = db
-      .prepare(
-        `SELECT id, challenge, rp_id, origin, expires_at
-         FROM webauthn_challenges
-         WHERE user_id = ? AND purpose = 'registration'
-         ORDER BY created_at DESC
-         LIMIT 1`
-      )
-      .get(userId) as
-      | { id: string; challenge: string; rp_id: string; origin: string; expires_at: number }
-      | undefined;
+    const challengeRow = await prisma.webauthnChallenge.findFirst({
+      where: { userId, purpose: "registration" },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, challenge: true, expiresAt: true },
+    });
 
-    if (!challengeRow || challengeRow.expires_at <= now) {
+    if (!challengeRow || challengeRow.expiresAt <= BigInt(now)) {
       return NextResponse.json({ error: "Registration challenge expired" }, { status: 400 });
     }
 
@@ -68,7 +63,6 @@ export async function POST(request: Request) {
 
     const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
 
-    // Newer @simplewebauthn/server exposes credential fields under `registrationInfo.credential`
     const credentialId = credential.id;
     const credentialIdBytes = fromBase64Url(credentialId);
     const cosePublicKey = Buffer.from(credential.publicKey);
@@ -106,73 +100,72 @@ export async function POST(request: Request) {
 
     const deployedAfter = await isSorobanContractDeployed(server, predictedAddress);
 
-    const credExists = db
-      .prepare("SELECT credential_id, user_id FROM webauthn_credentials WHERE credential_id = ?")
-      .get(credentialId) as { credential_id: string; user_id: string } | undefined;
+    const credExists = await prisma.webauthnCredential.findUnique({
+      where: { credentialId },
+      select: { id: true, userId: true },
+    });
 
-    if (credExists && credExists.user_id !== userId) {
+    if (credExists && credExists.userId !== userId) {
       return NextResponse.json(
         { error: "This passkey is already registered to a different user session." },
         { status: 409 }
       );
     }
 
-    const credId = credExists?.credential_id
-      ? (db
-          .prepare("SELECT id FROM webauthn_credentials WHERE credential_id = ?")
-          .get(credentialId) as { id: string }).id
-      : crypto.randomUUID();
-
-    db.prepare(
-      `INSERT INTO webauthn_credentials
-        (id, user_id, credential_id, credential_id_bytes, cose_public_key, p256_raw_public_key, sign_count, transports, device_type, backed_up, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(credential_id) DO UPDATE SET
-         user_id=excluded.user_id,
-         credential_id_bytes=excluded.credential_id_bytes,
-         cose_public_key=excluded.cose_public_key,
-         p256_raw_public_key=excluded.p256_raw_public_key,
-         sign_count=excluded.sign_count,
-         transports=excluded.transports,
-         device_type=excluded.device_type,
-         backed_up=excluded.backed_up`
-    ).run(
-      credId,
-      userId,
-      credentialId,
-      credentialIdBytes,
-      cosePublicKey,
-      rawPublicKey,
-      credential.counter,
-      JSON.stringify(credential.transports ?? body.response.response.transports ?? null),
-      credentialDeviceType,
-      credentialBackedUp ? 1 : 0,
-      now
+    const credId = credExists?.id ?? crypto.randomUUID();
+    const transports = JSON.stringify(
+      credential.transports ?? body.response.response.transports ?? null
     );
 
-    db.prepare(
-      `INSERT INTO smart_accounts
-        (id, user_id, credential_id, key_data_hex, salt_hex, smart_account_address, deployed, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(credential_id) DO UPDATE SET
-         user_id=excluded.user_id,
-         key_data_hex=excluded.key_data_hex,
-         salt_hex=excluded.salt_hex,
-         smart_account_address=excluded.smart_account_address,
-         deployed=excluded.deployed`
-    ).run(
-      crypto.randomUUID(),
-      userId,
-      credentialId,
-      keyDataHex,
-      saltHex,
-      predictedAddress,
-      deployedAfter ? 1 : 0,
-      now
-    );
+    await prisma.webauthnCredential.upsert({
+      where: { credentialId },
+      create: {
+        id: credId,
+        userId,
+        credentialId,
+        credentialIdBytes,
+        cosePublicKey,
+        p256RawPublicKey: rawPublicKey,
+        signCount: credential.counter,
+        transports,
+        deviceType: credentialDeviceType,
+        backedUp: credentialBackedUp ? 1 : 0,
+        createdAt: BigInt(now),
+      },
+      update: {
+        userId,
+        credentialIdBytes,
+        cosePublicKey,
+        p256RawPublicKey: rawPublicKey,
+        signCount: credential.counter,
+        transports,
+        deviceType: credentialDeviceType,
+        backedUp: credentialBackedUp ? 1 : 0,
+      },
+    });
 
-    // cleanup used challenge
-    db.prepare("DELETE FROM webauthn_challenges WHERE id = ?").run(challengeRow.id);
+    await prisma.smartAccount.upsert({
+      where: { credentialId },
+      create: {
+        id: crypto.randomUUID(),
+        userId,
+        credentialId,
+        keyDataHex,
+        saltHex,
+        smartAccountAddress: predictedAddress,
+        deployed: deployedAfter ? 1 : 0,
+        createdAt: BigInt(now),
+      },
+      update: {
+        userId,
+        keyDataHex,
+        saltHex,
+        smartAccountAddress: predictedAddress,
+        deployed: deployedAfter ? 1 : 0,
+      },
+    });
+
+    await prisma.webauthnChallenge.delete({ where: { id: challengeRow.id } });
 
     return NextResponse.json({
       credentialId,
@@ -192,4 +185,3 @@ export async function POST(request: Request) {
     );
   }
 }
-

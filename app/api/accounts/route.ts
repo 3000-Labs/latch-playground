@@ -1,32 +1,30 @@
 import { NextResponse } from "next/server";
-import { getDb } from "@/lib/db";
+import { prisma } from "@/lib/prisma";
 import { getOrCreateSession } from "@/lib/session";
+
+export const runtime = "nodejs";
 
 export async function GET() {
   try {
-    const db = getDb();
-    const { userId } = getOrCreateSession();
+    const { userId } = await getOrCreateSession();
 
-    const accounts = db
-      .prepare(
-        `SELECT smart_account_address, credential_id, deployed, created_at
-         FROM smart_accounts
-         WHERE user_id = ?
-         ORDER BY created_at DESC`
-      )
-      .all(userId) as Array<{
-      smart_account_address: string;
-      credential_id: string;
-      deployed: number;
-      created_at: number;
-    }>;
+    const accounts = await prisma.smartAccount.findMany({
+      where: { userId },
+      orderBy: { createdAt: "desc" },
+      select: {
+        smartAccountAddress: true,
+        credentialId: true,
+        deployed: true,
+        createdAt: true,
+      },
+    });
 
     return NextResponse.json({
       accounts: accounts.map((a) => ({
-        smartAccountAddress: a.smart_account_address,
-        credentialId: a.credential_id,
+        smartAccountAddress: a.smartAccountAddress,
+        credentialId: a.credentialId,
         deployed: !!a.deployed,
-        createdAt: a.created_at,
+        createdAt: Number(a.createdAt),
       })),
     });
   } catch (error) {
@@ -36,4 +34,3 @@ export async function GET() {
     );
   }
 }
-
