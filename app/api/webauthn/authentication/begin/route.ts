@@ -1,26 +1,29 @@
 import { NextResponse } from "next/server";
 import { generateAuthenticationOptions } from "@simplewebauthn/server";
 import type { PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/types";
-import { getDb, nowMs } from "@/lib/db";
+import { prisma } from "@/lib/prisma";
+import { nowMs } from "@/lib/db";
 import { getOrCreateSession } from "@/lib/session";
 import { getExpectedOriginFromRequest, getRpIdFromRequest } from "@/lib/webauthn-server";
 import * as crypto from "crypto";
 
+export const runtime = "nodejs";
+
 export async function POST(request: Request) {
   try {
-    const db = getDb();
     const { userId } = await getOrCreateSession();
     const rpID = getRpIdFromRequest(request);
     const expectedOrigin = getExpectedOriginFromRequest(request);
 
-    const creds = db
-      .prepare("SELECT credential_id, transports FROM webauthn_credentials WHERE user_id = ?")
-      .all(userId) as Array<{ credential_id: string; transports: string | null }>;
+    const creds = await prisma.webauthnCredential.findMany({
+      where: { userId },
+      select: { credentialId: true, transports: true },
+    });
 
     const allowCredentials =
       creds.length > 0
         ? creds.map((c) => ({
-            id: c.credential_id,
+            id: c.credentialId,
             type: "public-key" as const,
             transports: (() => {
               try {
@@ -48,18 +51,18 @@ export async function POST(request: Request) {
 
     const now = nowMs();
     const expiresAt = now + 5 * 60 * 1000;
-    db.prepare(
-      "INSERT INTO webauthn_challenges (id, user_id, purpose, challenge, rp_id, origin, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(
-      crypto.randomUUID(),
-      userId,
-      "authentication",
-      options.challenge,
-      rpID,
-      expectedOrigin,
-      expiresAt,
-      now
-    );
+    await prisma.webauthnChallenge.create({
+      data: {
+        id: crypto.randomUUID(),
+        userId,
+        purpose: "authentication",
+        challenge: options.challenge,
+        rpId: rpID,
+        origin: expectedOrigin,
+        expiresAt: BigInt(expiresAt),
+        createdAt: BigInt(now),
+      },
+    });
 
     return NextResponse.json({ options });
   } catch (error) {
@@ -69,4 +72,3 @@ export async function POST(request: Request) {
     );
   }
 }
-

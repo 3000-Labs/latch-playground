@@ -1,5 +1,7 @@
+import "server-only";
 import { cookies } from "next/headers";
-import { getDb, nowMs } from "@/lib/db";
+import { prisma } from "@/lib/prisma";
+import { nowMs } from "@/lib/db";
 import * as crypto from "crypto";
 
 const SESSION_COOKIE_NAME = "sid";
@@ -15,18 +17,21 @@ function randomId() {
 }
 
 export async function getOrCreateSession(): Promise<SessionInfo> {
-  const db = getDb();
   const jar = await cookies();
   const existing = jar.get(SESSION_COOKIE_NAME)?.value;
   const now = nowMs();
 
   if (existing) {
-    const row = db
-      .prepare("SELECT id, user_id, expires_at FROM sessions WHERE id = ?")
-      .get(existing) as { id: string; user_id: string; expires_at: number } | undefined;
+    const row = await prisma.session.findUnique({
+      where: { id: existing },
+      select: { id: true, userId: true, expiresAt: true },
+    });
 
-    if (row && row.expires_at > now) {
-      db.prepare("UPDATE sessions SET expires_at = ? WHERE id = ?").run(now + SESSION_TTL_MS, row.id);
+    if (row && row.expiresAt > BigInt(now)) {
+      await prisma.session.update({
+        where: { id: row.id },
+        data: { expiresAt: BigInt(now + SESSION_TTL_MS) },
+      });
       jar.set(SESSION_COOKIE_NAME, row.id, {
         httpOnly: true,
         sameSite: "lax",
@@ -34,19 +39,24 @@ export async function getOrCreateSession(): Promise<SessionInfo> {
         path: "/",
         maxAge: Math.floor(SESSION_TTL_MS / 1000),
       });
-      return { sessionId: row.id, userId: row.user_id };
+      return { sessionId: row.id, userId: row.userId };
     }
   }
 
   const userId = randomId();
   const sessionId = randomId();
-  db.prepare("INSERT INTO users (id, created_at) VALUES (?, ?)").run(userId, now);
-  db.prepare("INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)").run(
-    sessionId,
-    userId,
-    now,
-    now + SESSION_TTL_MS
-  );
+
+  await prisma.$transaction([
+    prisma.user.create({ data: { id: userId, createdAt: BigInt(now) } }),
+    prisma.session.create({
+      data: {
+        id: sessionId,
+        userId,
+        createdAt: BigInt(now),
+        expiresAt: BigInt(now + SESSION_TTL_MS),
+      },
+    }),
+  ]);
 
   jar.set(SESSION_COOKIE_NAME, sessionId, {
     httpOnly: true,
@@ -58,4 +68,3 @@ export async function getOrCreateSession(): Promise<SessionInfo> {
 
   return { sessionId, userId };
 }
-
