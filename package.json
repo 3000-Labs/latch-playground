@@ -91,7 +91,7 @@
     "zod": "3.25.67"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["better-sqlite3", "cbor-extract", "unrs-resolver"]
+    "onlyBuiltDependencies": ["@prisma/client", "@prisma/engines", "prisma", "cbor-extract", "unrs-resolver"]
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.9",
