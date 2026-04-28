@@ -1,0 +1,124 @@
+// Prisma schema for Latch.
+//
+// Postgres lives on Neon. Two URLs are used:
+//   - DATABASE_URL: Neon pooled host (often contains "-pooler") for runtime / Vercel.
+//                  Append pgbouncer=true&connection_limit=1 to the query string so Prisma
+//                  disables prepared statements (required for PgBouncer transaction mode).
+//   - DIRECT_URL: Neon direct host (non-pooler) used only by `prisma migrate`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id        String   @id
+  createdAt BigInt   @map("created_at")
+
+  sessions    Session[]
+  credentials WebauthnCredential[]
+  challenges  WebauthnChallenge[]
+  accounts    SmartAccount[]
+
+  @@map("users")
+}
+
+model Session {
+  id        String @id
+  userId    String @map("user_id")
+  createdAt BigInt @map("created_at")
+  expiresAt BigInt @map("expires_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId], map: "sessions_user_id_idx")
+  @@index([expiresAt], map: "sessions_expires_at_idx")
+  @@map("sessions")
+}
+
+model WebauthnCredential {
+  id String @id
+
+  userId String @map("user_id")
+
+  credentialId      String @unique @map("credential_id")
+  credentialIdBytes Bytes  @map("credential_id_bytes")
+
+  cosePublicKey     Bytes @map("cose_public_key")
+  p256RawPublicKey  Bytes @map("p256_raw_public_key")
+
+  signCount  Int     @map("sign_count")
+  transports String?
+  deviceType String? @map("device_type")
+  backedUp   Int     @default(0) @map("backed_up")
+
+  createdAt BigInt @map("created_at")
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  smartAccounts  SmartAccount[]
+  accountSigners AccountSigner[]
+
+  @@index([userId], map: "webauthn_credentials_user_id_idx")
+  @@map("webauthn_credentials")
+}
+
+model SmartAccount {
+  id           String @id
+  userId       String @map("user_id")
+  credentialId String @unique @map("credential_id")
+
+  keyDataHex          String @unique @map("key_data_hex")
+  saltHex             String @map("salt_hex")
+  smartAccountAddress String @unique @map("smart_account_address")
+
+  deployed  Int    @default(0)
+  createdAt BigInt @map("created_at")
+
+  user       User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credential WebauthnCredential  @relation(fields: [credentialId], references: [credentialId], onDelete: Cascade)
+  signers    AccountSigner[]
+
+  @@index([userId], map: "smart_accounts_user_id_idx")
+  @@map("smart_accounts")
+}
+
+model WebauthnChallenge {
+  id        String  @id
+  userId    String? @map("user_id")
+  purpose   String
+  challenge String
+  rpId      String  @map("rp_id")
+  origin    String
+  expiresAt BigInt  @map("expires_at")
+  createdAt BigInt  @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt], map: "webauthn_challenges_expires_idx")
+  @@map("webauthn_challenges")
+}
+
+// Recovery hook: allow multiple credentials / signer types per account later.
+//
+// Note: SQLite allowed credential_id NULL inside the composite PK; Postgres does not.
+// We use a generated id as the PK and keep (address, type, credential_id) as a
+// non-unique tuple. Upserts in the recovery route use findFirst + update-or-create.
+model AccountSigner {
+  id                  String  @id @default(cuid())
+  smartAccountAddress String  @map("smart_account_address")
+  signerType          String  @map("signer_type") // 'webauthn_credential' | 'guardian' | 'delegated' | 'backup_passkey_intent' | ...
+  credentialId        String? @map("credential_id")
+  label               String?
+  createdAt           BigInt  @map("created_at")
+
+  smartAccount SmartAccount        @relation(fields: [smartAccountAddress], references: [smartAccountAddress], onDelete: Cascade)
+  credential   WebauthnCredential? @relation(fields: [credentialId], references: [credentialId], onDelete: SetNull)
+
+  @@index([smartAccountAddress, signerType], map: "account_signers_addr_type_idx")
+  @@map("account_signers")
+}

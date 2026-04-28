@@ -1,16 +1,17 @@
 import { NextResponse } from "next/server";
 import { verifyAuthenticationResponse } from "@simplewebauthn/server";
 import type { AuthenticationResponseJSON } from "@simplewebauthn/types";
-import { getDb, nowMs } from "@/lib/db";
+import { prisma } from "@/lib/prisma";
+import { nowMs } from "@/lib/db";
 import { getOrCreateSession } from "@/lib/session";
 import { getExpectedOriginFromRequest, getRpIdFromRequest } from "@/lib/webauthn-server";
-import * as crypto from "crypto";
+
+export const runtime = "nodejs";
 
 type FinishBody = { response: AuthenticationResponseJSON };
 
 export async function POST(request: Request) {
   try {
-    const db = getDb();
     const { userId: sessionUserId } = await getOrCreateSession();
     const body = (await request.json()) as FinishBody;
     if (!body?.response) {
@@ -21,45 +22,27 @@ export async function POST(request: Request) {
     const expectedOrigin = getExpectedOriginFromRequest(request);
     const now = nowMs();
 
-    const challengeRow = db
-      .prepare(
-        `SELECT id, challenge, rp_id, origin, expires_at, user_id
-         FROM webauthn_challenges
-         WHERE purpose = 'authentication'
-         ORDER BY created_at DESC
-         LIMIT 1`
-      )
-      .get() as
-      | {
-          id: string;
-          challenge: string;
-          rp_id: string;
-          origin: string;
-          expires_at: number;
-          user_id: string | null;
-        }
-      | undefined;
+    const challengeRow = await prisma.webauthnChallenge.findFirst({
+      where: { purpose: "authentication" },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, challenge: true, expiresAt: true },
+    });
 
-    if (!challengeRow || challengeRow.expires_at <= now) {
+    if (!challengeRow || challengeRow.expiresAt <= BigInt(now)) {
       return NextResponse.json({ error: "Authentication challenge expired" }, { status: 400 });
     }
 
     const credentialId = body.response.id;
-    const cred = db
-      .prepare(
-        `SELECT user_id, credential_id, credential_id_bytes, cose_public_key, sign_count
-         FROM webauthn_credentials
-         WHERE credential_id = ?`
-      )
-      .get(credentialId) as
-      | {
-          user_id: string;
-          credential_id: string;
-          credential_id_bytes: Buffer;
-          cose_public_key: Buffer;
-          sign_count: number;
-        }
-      | undefined;
+    const cred = await prisma.webauthnCredential.findUnique({
+      where: { credentialId },
+      select: {
+        userId: true,
+        credentialId: true,
+        credentialIdBytes: true,
+        cosePublicKey: true,
+        signCount: true,
+      },
+    });
 
     if (!cred) {
       return NextResponse.json(
@@ -75,9 +58,9 @@ export async function POST(request: Request) {
       expectedRPID: rpID,
       requireUserVerification: false,
       credential: {
-        id: cred.credential_id,
-        publicKey: new Uint8Array(cred.cose_public_key),
-        counter: cred.sign_count,
+        id: cred.credentialId,
+        publicKey: new Uint8Array(cred.cosePublicKey),
+        counter: cred.signCount,
       },
     });
 
@@ -86,32 +69,29 @@ export async function POST(request: Request) {
     }
 
     const newCounter = verification.authenticationInfo.newCounter;
-    db.prepare("UPDATE webauthn_credentials SET sign_count = ? WHERE credential_id = ?").run(
-      newCounter,
-      credentialId
-    );
+    await prisma.webauthnCredential.update({
+      where: { credentialId },
+      data: { signCount: newCounter },
+    });
 
     // Attach this credential to the current session user so "List accounts" works after discoverable login.
-    if (cred.user_id !== sessionUserId) {
-      db.prepare("UPDATE webauthn_credentials SET user_id = ? WHERE credential_id = ?").run(
-        sessionUserId,
-        credentialId
-      );
-      db.prepare("UPDATE smart_accounts SET user_id = ? WHERE credential_id = ?").run(
-        sessionUserId,
-        credentialId
-      );
+    if (cred.userId !== sessionUserId) {
+      await prisma.$transaction([
+        prisma.webauthnCredential.update({
+          where: { credentialId },
+          data: { userId: sessionUserId },
+        }),
+        prisma.smartAccount.updateMany({
+          where: { credentialId },
+          data: { userId: sessionUserId },
+        }),
+      ]);
     }
 
-    const acct = db
-      .prepare(
-        `SELECT smart_account_address, deployed, key_data_hex
-         FROM smart_accounts
-         WHERE credential_id = ?`
-      )
-      .get(credentialId) as
-      | { smart_account_address: string; deployed: number; key_data_hex: string }
-      | undefined;
+    const acct = await prisma.smartAccount.findUnique({
+      where: { credentialId },
+      select: { smartAccountAddress: true, deployed: true, keyDataHex: true },
+    });
 
     if (!acct) {
       return NextResponse.json(
@@ -120,29 +100,22 @@ export async function POST(request: Request) {
       );
     }
 
-    const accounts = db
-      .prepare(
-        `SELECT smart_account_address, credential_id, deployed
-         FROM smart_accounts
-         WHERE user_id = ?
-         ORDER BY created_at DESC`
-      )
-      .all(sessionUserId) as Array<{
-      smart_account_address: string;
-      credential_id: string;
-      deployed: number;
-    }>;
+    const accounts = await prisma.smartAccount.findMany({
+      where: { userId: sessionUserId },
+      orderBy: { createdAt: "desc" },
+      select: { smartAccountAddress: true, credentialId: true, deployed: true },
+    });
 
-    db.prepare("DELETE FROM webauthn_challenges WHERE id = ?").run(challengeRow.id);
+    await prisma.webauthnChallenge.delete({ where: { id: challengeRow.id } });
 
     return NextResponse.json({
-      smartAccountAddress: acct.smart_account_address,
-      keyDataHex: acct.key_data_hex,
+      smartAccountAddress: acct.smartAccountAddress,
+      keyDataHex: acct.keyDataHex,
       deployed: !!acct.deployed,
       activeCredentialId: credentialId,
       accounts: accounts.map((a) => ({
-        smartAccountAddress: a.smart_account_address,
-        credentialId: a.credential_id,
+        smartAccountAddress: a.smartAccountAddress,
+        credentialId: a.credentialId,
         deployed: !!a.deployed,
       })),
     });
@@ -153,4 +126,3 @@ export async function POST(request: Request) {
     );
   }
 }
-
