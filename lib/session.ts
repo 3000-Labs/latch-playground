@@ -2,6 +2,7 @@ import "server-only";
 import { cookies } from "next/headers";
 import { prisma } from "@/lib/prisma";
 import { nowMs } from "@/lib/db";
+import { crossSiteCookieAttrs } from "@/lib/cookie-cross-site";
 import * as crypto from "crypto";
 
 const SESSION_COOKIE_NAME = "sid";
@@ -34,10 +35,9 @@ export async function getOrCreateSession(): Promise<SessionInfo> {
       });
       jar.set(SESSION_COOKIE_NAME, row.id, {
         httpOnly: true,
-        sameSite: "lax",
-        secure: process.env.NODE_ENV === "production",
         path: "/",
         maxAge: Math.floor(SESSION_TTL_MS / 1000),
+        ...crossSiteCookieAttrs(),
       });
       return { sessionId: row.id, userId: row.userId };
     }
@@ -60,10 +60,9 @@ export async function getOrCreateSession(): Promise<SessionInfo> {
 
   jar.set(SESSION_COOKIE_NAME, sessionId, {
     httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
     path: "/",
     maxAge: Math.floor(SESSION_TTL_MS / 1000),
+    ...crossSiteCookieAttrs(),
   });
 
   return { sessionId, userId };

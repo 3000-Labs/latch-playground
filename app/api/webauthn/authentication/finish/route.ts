@@ -4,11 +4,15 @@ import type { AuthenticationResponseJSON } from "@simplewebauthn/types";
 import { prisma } from "@/lib/prisma";
 import { nowMs } from "@/lib/db";
 import { getOrCreateSession } from "@/lib/session";
-import { getExpectedOriginFromRequest, getRpIdFromRequest } from "@/lib/webauthn-server";
+import {
+  getOriginFromClientDataJSON,
+  resolveWebauthnFinishVerification,
+  WebauthnCeremonyConfigError,
+} from "@/lib/webauthn-server";
 
 export const runtime = "nodejs";
 
-type FinishBody = { response: AuthenticationResponseJSON };
+type FinishBody = { response: AuthenticationResponseJSON; chromeExtensionId?: string };
 
 export async function POST(request: Request) {
   try {
@@ -18,18 +22,34 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Missing response" }, { status: 400 });
     }
 
-    const rpID = getRpIdFromRequest(request);
-    const expectedOrigin = getExpectedOriginFromRequest(request);
     const now = nowMs();
 
     const challengeRow = await prisma.webauthnChallenge.findFirst({
       where: { purpose: "authentication" },
       orderBy: { createdAt: "desc" },
-      select: { id: true, challenge: true, expiresAt: true },
+      select: { id: true, challenge: true, expiresAt: true, rpId: true, origin: true },
     });
 
     if (!challengeRow || challengeRow.expiresAt <= BigInt(now)) {
       return NextResponse.json({ error: "Authentication challenge expired" }, { status: 400 });
+    }
+
+    const clientDataOrigin = getOriginFromClientDataJSON(body.response.response.clientDataJSON);
+
+    let verifyParams: { expectedOrigin: string; expectedRPID: string | string[] };
+    try {
+      verifyParams = resolveWebauthnFinishVerification({
+        challengeOrigin: challengeRow.origin,
+        challengeRpId: challengeRow.rpId,
+        clientDataOrigin,
+        chromeExtensionId: body.chromeExtensionId,
+        request,
+      });
+    } catch (e) {
+      if (e instanceof WebauthnCeremonyConfigError) {
+        return NextResponse.json({ error: e.message }, { status: 400 });
+      }
+      throw e;
     }
 
     const credentialId = body.response.id;
@@ -54,8 +74,8 @@ export async function POST(request: Request) {
     const verification = await verifyAuthenticationResponse({
       response: body.response,
       expectedChallenge: challengeRow.challenge,
-      expectedOrigin,
-      expectedRPID: rpID,
+      expectedOrigin: verifyParams.expectedOrigin,
+      expectedRPID: verifyParams.expectedRPID,
       requireUserVerification: false,
       credential: {
         id: cred.credentialId,

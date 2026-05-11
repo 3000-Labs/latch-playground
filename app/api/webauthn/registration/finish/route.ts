@@ -7,9 +7,10 @@ import { getOrCreateSession } from "@/lib/session";
 import {
   coseEc2ToRawP256Uncompressed,
   fromBase64Url,
-  getExpectedOriginFromRequest,
-  getRpIdFromRequest,
+  getOriginFromClientDataJSON,
+  resolveWebauthnFinishVerification,
   sha256Hex,
+  WebauthnCeremonyConfigError,
 } from "@/lib/webauthn-server";
 import {
   buildWebauthnAccountInitParams,
@@ -24,7 +25,7 @@ import * as crypto from "crypto";
 
 export const runtime = "nodejs";
 
-type FinishBody = { response: RegistrationResponseJSON };
+type FinishBody = { response: RegistrationResponseJSON; chromeExtensionId?: string };
 
 export async function POST(request: Request) {
   try {
@@ -35,25 +36,41 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Missing response" }, { status: 400 });
     }
 
-    const rpID = getRpIdFromRequest(request);
-    const expectedOrigin = getExpectedOriginFromRequest(request);
     const now = nowMs();
 
     const challengeRow = await prisma.webauthnChallenge.findFirst({
       where: { userId, purpose: "registration" },
       orderBy: { createdAt: "desc" },
-      select: { id: true, challenge: true, expiresAt: true },
+      select: { id: true, challenge: true, expiresAt: true, rpId: true, origin: true },
     });
 
     if (!challengeRow || challengeRow.expiresAt <= BigInt(now)) {
       return NextResponse.json({ error: "Registration challenge expired" }, { status: 400 });
     }
 
+    const clientDataOrigin = getOriginFromClientDataJSON(body.response.response.clientDataJSON);
+
+    let verifyParams: { expectedOrigin: string; expectedRPID: string | string[] };
+    try {
+      verifyParams = resolveWebauthnFinishVerification({
+        challengeOrigin: challengeRow.origin,
+        challengeRpId: challengeRow.rpId,
+        clientDataOrigin,
+        chromeExtensionId: body.chromeExtensionId,
+        request,
+      });
+    } catch (e) {
+      if (e instanceof WebauthnCeremonyConfigError) {
+        return NextResponse.json({ error: e.message }, { status: 400 });
+      }
+      throw e;
+    }
+
     const verification = await verifyRegistrationResponse({
       response: body.response,
       expectedChallenge: challengeRow.challenge,
-      expectedOrigin,
-      expectedRPID: rpID,
+      expectedOrigin: verifyParams.expectedOrigin,
+      expectedRPID: verifyParams.expectedRPID,
       requireUserVerification: false,
     });
 
