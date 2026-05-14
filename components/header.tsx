@@ -36,6 +36,12 @@ export const Header = () => {
             >
               Contact
             </Link>
+             <Link
+              className="uppercase inline-block font-mono text-sm text-foreground/60 hover:text-foreground/100 duration-150 transition-colors ease-out"
+              href="/privacy"
+            >
+              Privacy
+            </Link>
         </nav>
         <div className="max-lg:hidden w-[100px]" /> {/* Spacer to balance logo */}
         <MobileMenu />

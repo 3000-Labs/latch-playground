@@ -77,6 +77,13 @@ export const MobileMenu = ({ className }: MobileMenuProps) => {
               >
                 Contact
               </Link>
+               <Link
+                href="/privacy"
+                onClick={() => setIsOpen(false)}
+                className="text-xl font-mono uppercase text-foreground/60 transition-colors ease-out duration-150 hover:text-foreground/100 py-2"
+              >
+                Privacy
+              </Link>
           </nav>
         </Dialog.Content>
       </Dialog.Portal>
