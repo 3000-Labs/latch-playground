@@ -4,7 +4,7 @@ import type { PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/type
 import { prisma } from "@/lib/prisma";
 import { nowMs } from "@/lib/db";
 import { getOrCreateSession } from "@/lib/session";
-import { getExpectedOriginFromRequest, getRpIdFromRequest } from "@/lib/webauthn-server";
+import { resolveWebauthnCeremonyContext, WebauthnCeremonyConfigError } from "@/lib/webauthn-server";
 import * as crypto from "crypto";
 
 export const runtime = "nodejs";
@@ -12,8 +12,20 @@ export const runtime = "nodejs";
 export async function POST(request: Request) {
   try {
     const { userId } = await getOrCreateSession();
-    const rpID = getRpIdFromRequest(request);
-    const expectedOrigin = getExpectedOriginFromRequest(request);
+    const body = (await request.json().catch(() => ({}))) as { chromeExtensionId?: string };
+    let rpID: string;
+    let expectedOrigin: string;
+    try {
+      ({ rpId: rpID, origin: expectedOrigin } = resolveWebauthnCeremonyContext(
+        request,
+        body.chromeExtensionId
+      ));
+    } catch (e) {
+      if (e instanceof WebauthnCeremonyConfigError) {
+        return NextResponse.json({ error: e.message }, { status: 400 });
+      }
+      throw e;
+    }
 
     const creds = await prisma.webauthnCredential.findMany({
       where: { userId },
@@ -49,6 +61,8 @@ export async function POST(request: Request) {
       throw new Error("WebAuthn authentication options missing challenge");
     }
 
+    const issuedRpId = typeof options.rpId === "string" ? options.rpId : rpID;
+
     const now = nowMs();
     const expiresAt = now + 5 * 60 * 1000;
     await prisma.webauthnChallenge.create({
@@ -57,7 +71,7 @@ export async function POST(request: Request) {
         userId,
         purpose: "authentication",
         challenge: options.challenge,
-        rpId: rpID,
+        rpId: issuedRpId,
         origin: expectedOrigin,
         expiresAt: BigInt(expiresAt),
         createdAt: BigInt(now),

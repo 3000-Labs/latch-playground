@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
+import { crossSiteCookieAttrs } from "@/lib/cookie-cross-site";
 
 export async function POST(request: Request) {
   try {
@@ -11,10 +12,9 @@ export async function POST(request: Request) {
     const jar = await cookies();
     jar.set("activeSmartAccountAddress", body.smartAccountAddress, {
       httpOnly: false,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
       path: "/",
       maxAge: 60 * 60 * 24 * 30,
+      ...crossSiteCookieAttrs(),
     });
 
     return NextResponse.json({ ok: true });

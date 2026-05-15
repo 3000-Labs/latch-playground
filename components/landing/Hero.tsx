@@ -39,6 +39,16 @@ export function Hero() {
           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-primary/20 rounded-full blur-[120px]" />
       </div>
 
+      <footer className="absolute bottom-0 left-0 right-0 z-10 border-t border-border/60 bg-background/80 backdrop-blur-sm">
+        <div className="container flex flex-wrap items-center justify-center gap-x-6 gap-y-2 py-4">
+          <Link
+            href="/privacy"
+            className="font-mono text-xs uppercase text-foreground/50 transition-colors hover:text-foreground/90"
+          >
+            Privacy Policy
+          </Link>
+        </div>
+      </footer>
     </div>
   );
 }

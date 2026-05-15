@@ -12,12 +12,16 @@ Set for **Production**, **Preview**, and **Development** as appropriate.
 | `DIRECT_URL` | Neon **direct** connection string (same user/database, host **without** `-pooler`). Used only by `prisma migrate`. Do **not** add `pgbouncer=true` here. |
 | `WEBAUTHN_RP_ID` | Relying Party ID: hostname only, no scheme/port (e.g. `yourdomain.com` in production). |
 | `WEBAUTHN_ORIGIN` | Full origin with scheme (e.g. `https://yourdomain.com`). Must match the URL users use in the browser. |
+| `WEBAUTHN_EXTENSION_IDS` | Optional comma-separated Chrome extension IDs. Required if the extension sends `chromeExtensionId` on WebAuthn begin routes. |
+| `API_CORS_ALLOWED_ORIGINS` | Optional comma-separated exact origins for credentialed CORS on `/api/*` (e.g. `https://yourdomain.com,chrome-extension://<id>`). Needed for extension `fetch` with `credentials: "include"`. |
 | `NEXT_PUBLIC_RPC_URL` | Soroban RPC URL |
 | `NEXT_PUBLIC_NETWORK_PASSPHRASE` | Stellar network passphrase |
 | `NEXT_PUBLIC_FACTORY_ADDRESS` | Factory contract address |
 | `BUNDLER_SECRET` | Server-only secret for deployment (never expose to client) |
 
 ### WebAuthn production gotcha
+
+Production sets session cookies with `SameSite=None; Secure` so cross-origin extension requests can keep a session. Restrict who can call your API via `API_CORS_ALLOWED_ORIGINS` (exact origins only; never use `*` with credentials).
 
 If `WEBAUTHN_RP_ID` or `WEBAUTHN_ORIGIN` does not match the deployed site, passkeys will fail verification (wrong RP ID / origin). Common mistakes:
 
